@@ -105,8 +105,10 @@ python evaluate_esc50.py --esc50_dir ./ESC-50
 python evaluate_esc50.py --esc50_dir ./ESC-50 --model mn10_as --device auto
 ```
 
+결과는 실행마다 `results/ver1`, `results/ver2`, ... 형태의 새 폴더에 저장됩니다.
+
 저장 파일:
 
-- `confusion_matrix.png`
-- `eval_results.csv`
-- `classification_report.txt`
+- `results/verN/confusion_matrix.png`
+- `results/verN/eval_results.csv`
+- `results/verN/classification_report.txt`

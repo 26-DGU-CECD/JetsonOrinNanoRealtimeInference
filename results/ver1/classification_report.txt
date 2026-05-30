@@ -1,6 +1,7 @@
 === ESC-50 Evaluation (mapped samples only) ===
 Model: mn10_as
 Device: cpu
+Results directory: C:\Users\Gamzadole\Desktop\jetson_ef\results\ver1
 Mapped samples: 480 / 2000
 Evaluated samples: 480
 Skipped samples: 0

@@ -112,6 +112,11 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Inference device.",
     )
+    parser.add_argument(
+        "--results-dir",
+        default="./results",
+        help="Root directory for versioned evaluation outputs.",
+    )
     return parser.parse_args()
 
 
@@ -284,9 +289,23 @@ def save_confusion_matrix(y_true: List[str], y_pred: List[str], output_path: Pat
     plt.close()
 
 
+def create_next_results_dir(results_root: Path) -> Path:
+    results_root.mkdir(parents=True, exist_ok=True)
+
+    version = 1
+    while True:
+        output_dir = results_root / f"ver{version}"
+        try:
+            output_dir.mkdir()
+            return output_dir
+        except FileExistsError:
+            version += 1
+
+
 def main() -> int:
     args = parse_args()
     esc50_dir = Path(args.esc50_dir).resolve()
+    results_root = Path(args.results_dir).resolve()
 
     try:
         device = resolve_device(args.device)
@@ -372,15 +391,21 @@ def main() -> int:
         zero_division=0,
     )
 
+    output_dir = create_next_results_dir(results_root)
+    eval_results_path = output_dir / "eval_results.csv"
+    confusion_matrix_path = output_dir / "confusion_matrix.png"
+    classification_report_path = output_dir / "classification_report.txt"
+
     results_df = pd.DataFrame(results)
-    results_df.to_csv("eval_results.csv", index=False)
+    results_df.to_csv(eval_results_path, index=False)
 
-    save_confusion_matrix(y_true, y_pred, Path("confusion_matrix.png"))
+    save_confusion_matrix(y_true, y_pred, confusion_matrix_path)
 
-    with open("classification_report.txt", "w", encoding="utf-8") as report_file:
+    with open(classification_report_path, "w", encoding="utf-8") as report_file:
         report_file.write("=== ESC-50 Evaluation (mapped samples only) ===\n")
         report_file.write(f"Model: {args.model}\n")
         report_file.write(f"Device: {device}\n")
+        report_file.write(f"Results directory: {output_dir}\n")
         report_file.write(f"Mapped samples: {len(mapped_df)} / 2000\n")
         report_file.write(f"Evaluated samples: {len(results)}\n")
         report_file.write(f"Skipped samples: {skipped}\n")
@@ -397,9 +422,10 @@ def main() -> int:
     print()
     print("클래스별 결과:")
     print(report)
-    print("Confusion Matrix -> confusion_matrix.png 저장 완료")
-    print("상세 결과 -> eval_results.csv 저장 완료")
-    print("Classification Report -> classification_report.txt 저장 완료")
+    print(f"Results directory -> {output_dir}")
+    print(f"Confusion Matrix -> {confusion_matrix_path} 저장 완료")
+    print(f"상세 결과 -> {eval_results_path} 저장 완료")
+    print(f"Classification Report -> {classification_report_path} 저장 완료")
     return 0
 
 
