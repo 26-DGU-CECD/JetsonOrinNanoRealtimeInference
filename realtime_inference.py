@@ -6,6 +6,7 @@ import io
 import os
 import queue
 import sys
+import warnings
 from contextlib import nullcontext, redirect_stdout
 from datetime import datetime
 from pathlib import Path
@@ -34,12 +35,16 @@ DEFAULT_NOISE_REDUCTION_DB = 18.0
 DEFAULT_MAIN_GAIN_DB = 8.0
 DEFAULT_ENHANCE_SHARPNESS = 2.0
 DEFAULT_MIN_SCORE = 0.05
+ANSI_GREEN = "\033[32m"
+ANSI_RED = "\033[31m"
+ANSI_RESET = "\033[0m"
 
 # EfficientAT AudioSet pretrained models use the official 32 kHz frontend.
 N_MELS = 128
 WINDOW_SIZE = 800
 HOP_SIZE = 320
 N_FFT = 1024
+FMAX = MODEL_SAMPLE_RATE // 2 - 1000
 
 MIC_NAME_KEYWORDS = ("respeaker", "re speaker", "seeed", "array v3")
 
@@ -109,7 +114,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_MIN_DB,
         help=(
-            "Ignore chunks quieter than this level. Positive values are treated as "
+            "Mark chunks quieter than this level as low signal. Positive values are treated as "
             "dB below full scale, so 30 means -30 dBFS. Use 0 or a negative value "
             "to pass an explicit dBFS threshold."
         ),
@@ -151,7 +156,7 @@ def parse_args() -> argparse.Namespace:
         "--min-score",
         type=float,
         default=DEFAULT_MIN_SCORE,
-        help="Only print predictions whose best custom sigmoid score is at least this value.",
+        help="Mark predictions whose best custom sigmoid score is below this value as low confidence.",
     )
     return parser.parse_args()
 
@@ -234,7 +239,13 @@ def load_efficientat(
         from models.mn.model import get_model as get_mn  # type: ignore
         from models.preprocess import AugmentMelSTFT  # type: ignore
 
-        with redirect_stdout(io.StringIO()):
+        with redirect_stdout(io.StringIO()), warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Don't use ConvNormActivation directly.*",
+                category=UserWarning,
+                module="torchvision\\.ops\\.misc",
+            )
             model = get_mn(
                 width_mult=NAME_TO_WIDTH(MODEL_NAME),
                 pretrained_name=MODEL_NAME,
@@ -248,6 +259,7 @@ def load_efficientat(
             win_length=WINDOW_SIZE,
             hopsize=HOP_SIZE,
             n_fft=N_FFT,
+            fmax=FMAX,
             freqm=0,
             timem=0,
         )
@@ -316,7 +328,7 @@ def predict_chunk(
     elif input_tensor.shape[1] > MODEL_INPUT_SAMPLES:
         input_tensor = input_tensor[:, :MODEL_INPUT_SAMPLES]
 
-    amp_context = torch.cuda.amp.autocast(enabled=True) if device.type == "cuda" else nullcontext()
+    amp_context = torch.amp.autocast("cuda", enabled=True) if device.type == "cuda" else nullcontext()
     with torch.no_grad(), amp_context:
         spec = mel(input_tensor)
         logits, _ = model(spec.unsqueeze(0))
@@ -401,6 +413,12 @@ def format_scores(scores: Dict[str, float]) -> str:
     return ", ".join(f"{label}={probability:.1%}" for label, probability in scores.items())
 
 
+def colorize(text: str, color_code: str) -> str:
+    if not sys.stdout.isatty():
+        return text
+    return f"{color_code}{text}{ANSI_RESET}"
+
+
 def run_stream(
     device_index: int,
     device_info: dict,
@@ -480,15 +498,6 @@ def run_stream(
                 chunk_dbfs = rms_dbfs(chunk)
                 min_dbfs = db_gate_threshold(min_db)
 
-                if chunk_dbfs < min_dbfs:
-                    if debug:
-                        print(
-                            f"[{timestamp}] skip: level={chunk_dbfs:+.1f} dBFS "
-                            f"< gate={min_dbfs:+.1f} dBFS",
-                            flush=True,
-                        )
-                    continue
-
                 inference_chunk, clipped, quiet_gain, loud_gain = enhance_chunk(
                     chunk,
                     enhance_threshold_db,
@@ -515,24 +524,28 @@ def run_stream(
                     )
                     continue
 
+                status_reasons = []
+                if chunk_dbfs < min_dbfs:
+                    status_reasons.append(f"소리작음 {chunk_dbfs:+.1f}<{min_dbfs:+.1f}dBFS")
                 if best_probability < min_score:
-                    if debug:
-                        print(
-                            f"[{timestamp}] ignore: best={best_label} "
-                            f"({best_probability:.1%}) < min_score={min_score:.1%} | "
-                            f"전체: {format_scores(scores)}",
-                            flush=True,
-                        )
-                    continue
+                    status_reasons.append(f"점수낮음 {best_probability:.1%}<{min_score:.1%}")
 
-                print(
+                if status_reasons:
+                    status = "낮음(" + ", ".join(status_reasons) + ")"
+                    line_color = ANSI_RED
+                else:
+                    status = "감지"
+                    line_color = ANSI_GREEN
+
+                line = (
                     f"[{timestamp}] 예측: {best_label} ({best_probability:.1%}) | "
+                    f"status={status} | "
                     f"level={chunk_dbfs:+.1f} dBFS | "
                     f"enhanced={rms_dbfs(inference_chunk):+.1f} dBFS | "
                     f"quiet_gain={quiet_gain:.2f}x loud_gain={loud_gain:.2f}x"
-                    f"{' clipped' if clipped else ''} | 전체: {format_scores(scores)}",
-                    flush=True,
+                    f"{' clipped' if clipped else ''} | 전체: {format_scores(scores)}"
                 )
+                print(colorize(line, line_color), flush=True)
 
             remainder = joined[offset:]
             pending_blocks = [remainder] if remainder.size else []
