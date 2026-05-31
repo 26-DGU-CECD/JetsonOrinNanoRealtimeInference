@@ -7,7 +7,7 @@ else
   echo "EfficientAT already exists; skipping clone."
 fi
 
-pip install torch torchaudio sounddevice numpy
+pip install torch torchaudio sounddevice "numpy<2"
 
 # EfficientAT's MobileNet model imports torchvision.ops.misc.
 pip install torchvision
