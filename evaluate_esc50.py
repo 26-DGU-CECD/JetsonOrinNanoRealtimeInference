@@ -39,6 +39,7 @@ N_MELS = 128
 WINDOW_SIZE = 800
 HOP_SIZE = 320
 N_FFT = 1024
+FMAX = MODEL_SAMPLE_RATE // 2 - 1000
 
 LABEL_MAPPING = {
     "construction": ["Jackhammer", "Drill"],
@@ -144,7 +145,13 @@ def load_efficientat(model_name: str, device: torch.device):
         from models.mn.model import get_model as get_mn  # type: ignore
         from models.preprocess import AugmentMelSTFT  # type: ignore
 
-        with redirect_stdout(io.StringIO()):
+        with redirect_stdout(io.StringIO()), warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Don't use ConvNormActivation directly.*",
+                category=UserWarning,
+                module="torchvision\\.ops\\.misc",
+            )
             model = get_mn(
                 width_mult=NAME_TO_WIDTH(model_name),
                 pretrained_name=model_name,
@@ -158,6 +165,7 @@ def load_efficientat(model_name: str, device: torch.device):
             win_length=WINDOW_SIZE,
             hopsize=HOP_SIZE,
             n_fft=N_FFT,
+            fmax=FMAX,
             freqm=0,
             timem=0,
         )
@@ -251,7 +259,7 @@ def predict_custom_scores(
     custom_indices: Dict[str, List[int]],
     device: torch.device,
 ) -> Tuple[str, Dict[str, float]]:
-    amp_context = torch.cuda.amp.autocast(enabled=True) if device.type == "cuda" else nullcontext()
+    amp_context = torch.amp.autocast("cuda", enabled=True) if device.type == "cuda" else nullcontext()
     with torch.no_grad(), amp_context:
         spec = mel(waveform)
         logits, _ = model(spec.unsqueeze(0))
