@@ -9,9 +9,10 @@ import signal
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -85,6 +86,38 @@ CAUTION_LABELS = {
     "baby_cry",
     "animal_cry",
 }
+
+RESPEAKER_USB_VENDOR_ID = 0x2886
+RESPEAKER_USB_PRODUCT_ID = 0x0018
+SPEED_OF_SOUND_M_S = 343.0
+RAW_DOA_CHANNELS = (1, 2, 3, 4)
+RAW_DOA_MIC_POSITIONS_M = np.asarray(
+    [
+        (-0.032, 0.000),
+        (0.000, -0.032),
+        (0.032, 0.000),
+        (0.000, 0.032),
+    ],
+    dtype=np.float32,
+)
+
+
+def parse_optional_db_gate(value: str) -> float | None:
+    normalized = str(value).strip().lower()
+    if normalized in {"off", "none", "disable", "disabled", "all"}:
+        return None
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "expected a number, or one of: off, none, disabled, all"
+        ) from exc
+
+
+def format_optional_db_gate(value: float | None) -> str:
+    if value is None:
+        return "off"
+    return f"{db_gate_threshold(value):+.1f}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -194,6 +227,37 @@ def parse_args() -> argparse.Namespace:
         help="Run BLE inference without trying to read ReSpeaker DOA.",
     )
     parser.add_argument(
+        "--doa-source",
+        choices=("auto", "audio", "usb"),
+        default="auto",
+        help=(
+            "DOA source. auto uses raw mic audio when available and falls back to "
+            "the ReSpeaker USB DSP angle. Default: auto."
+        ),
+    )
+    parser.add_argument(
+        "--doa-poll-interval",
+        type=float,
+        default=0.1,
+        help="Seconds between background USB DSP DOA polls. Default: 0.1.",
+    )
+    parser.add_argument(
+        "--audio-doa-min-db",
+        type=parse_optional_db_gate,
+        default=None,
+        help=(
+            "Minimum raw mic level for audio-based DOA. Positive values are treated "
+            "as dB below full scale, so 45 means -45 dBFS. Use 'off' to calculate "
+            "DOA even for quiet raw mic windows. Default: off."
+        ),
+    )
+    parser.add_argument(
+        "--audio-doa-window-ms",
+        type=float,
+        default=250.0,
+        help="Loudest raw mic window length used for audio-based DOA. Default: 250.",
+    )
+    parser.add_argument(
         "--db-offset",
         type=float,
         default=80.0,
@@ -225,22 +289,44 @@ def corrected_angle(raw_angle: float, north_offset: float) -> int:
     return int(round((float(raw_angle) - float(north_offset)) % 360.0)) % 360
 
 
+@dataclass(frozen=True)
+class DOAReading:
+    raw_angle: int | None
+    source: str
+    status: str
+
+
 class DOAReader:
-    def __init__(self, enabled: bool = True):
+    def __init__(
+        self,
+        enabled: bool = True,
+        poll_interval: float = 0.1,
+        disabled_reason: str = "disabled",
+    ):
         self.ok = False
         self.tuning = None
         self.status = "disabled"
+        self.poll_interval = max(0.02, float(poll_interval))
         self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_angle: int | None = None
+        self._last_voice: bool | None = None
+        self._last_read_at: float | None = None
+        self._last_error: str | None = None
 
         if not enabled:
-            print("[DOA] disabled by --disable-doa", file=sys.stderr, flush=True)
+            print(f"[DOA] USB reader {disabled_reason}", file=sys.stderr, flush=True)
             return
 
         try:
             import usb.core  # type: ignore
             from tuning import Tuning  # type: ignore
 
-            dev = usb.core.find(idVendor=0x2886, idProduct=0x0018)
+            dev = usb.core.find(
+                idVendor=RESPEAKER_USB_VENDOR_ID,
+                idProduct=RESPEAKER_USB_PRODUCT_ID,
+            )
             if dev is None:
                 self.status = "device_not_found"
                 print("[DOA] ReSpeaker USB control device not found.", file=sys.stderr, flush=True)
@@ -249,24 +335,269 @@ class DOAReader:
             self.tuning = Tuning(dev)
             self.ok = True
             self.status = "enabled"
-            print("[DOA] ReSpeaker DOA reader enabled.", file=sys.stderr, flush=True)
+            self._poll_once()
+            self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+            self._thread.start()
+            if self.status == "enabled":
+                print("[DOA] ReSpeaker USB DOA reader enabled.", file=sys.stderr, flush=True)
+            else:
+                usb_status = self.status
+                if self._last_error:
+                    usb_status = f"{usb_status}:{self._last_error}"
+                print(
+                    f"[DOA] ReSpeaker USB control found, but reads failed: {usb_status}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         except Exception as exc:
             self.status = "unavailable"
             print(f"[DOA] disabled: {exc!r}", file=sys.stderr, flush=True)
 
-    def read_angle(self) -> int | None:
+    def _read_device_locked(self) -> Tuple[int | None, bool | None]:
+        if self.tuning is None:
+            return None, None
+
+        voice = None
+        try:
+            voice_value = self.tuning.is_voice()
+            if voice_value is not None:
+                voice = bool(int(voice_value))
+        except Exception:
+            voice = None
+
+        angle = self.tuning.direction
+        if angle is None:
+            return None, voice
+        return int(float(angle)) % 360, voice
+
+    def _poll_once(self) -> None:
         if not self.ok or self.tuning is None:
-            return None
+            return
 
         try:
             with self._lock:
-                angle = self.tuning.direction
-            if angle is None:
-                return None
-            return int(float(angle)) % 360
-        except Exception:
+                angle, voice = self._read_device_locked()
+            now = time.monotonic()
+            self._last_read_at = now
+            self._last_voice = voice
+            if angle is not None:
+                self._last_angle = angle
+            self.status = "enabled"
+            self._last_error = None
+        except Exception as exc:
             self.status = "read_error"
+            self._last_error = type(exc).__name__
+
+    def _poll_loop(self) -> None:
+        while not self._stop_event.wait(self.poll_interval):
+            self._poll_once()
+
+    def read_angle(self) -> int | None:
+        return self.snapshot().raw_angle
+
+    def snapshot(self) -> DOAReading:
+        if not self.ok:
+            return DOAReading(None, "usb", self.status)
+
+        self._poll_once()
+        angle = self._last_angle
+        if angle is None:
+            status = self.status
+            if self._last_error:
+                status = f"{status}:{self._last_error}"
+            if status == "enabled":
+                status = "usb_no_angle"
+            return DOAReading(None, "usb", status)
+
+        now = time.monotonic()
+        age = None if self._last_read_at is None else now - self._last_read_at
+        if age is not None and age > max(1.0, self.poll_interval * 5.0):
+            return DOAReading(None, "usb", "usb_stale")
+
+        if self._last_voice is False:
+            status = "usb_no_voice"
+        else:
+            status = "usb_active"
+        return DOAReading(angle, "usb", status)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self.tuning is not None:
+            try:
+                self.tuning.close()
+            except Exception:
+                pass
+
+
+class AudioDOAEstimator:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        stream_channels: int,
+        sample_rate: int,
+        min_db: float | None,
+        window_ms: float,
+    ):
+        self.enabled = enabled
+        self.stream_channels = stream_channels
+        self.sample_rate = sample_rate
+        self.min_dbfs = None if min_db is None else db_gate_threshold(min_db)
+        self.window_samples = max(256, int(round(sample_rate * max(20.0, window_ms) / 1000.0)))
+        self.status = "disabled"
+        self.channel_indices = tuple(RAW_DOA_CHANNELS)
+        self.mic_positions = RAW_DOA_MIC_POSITIONS_M
+        self.pairs = [
+            (left, right)
+            for left in range(len(self.channel_indices))
+            for right in range(left + 1, len(self.channel_indices))
+        ]
+        self.expected_taus = self._build_expected_taus()
+
+        if not enabled:
+            return
+        if stream_channels <= max(self.channel_indices):
+            self.status = "audio_channels_unavailable"
+            return
+        self.status = "audio_enabled"
+
+    def _build_expected_taus(self) -> np.ndarray:
+        compass_degrees = np.arange(360, dtype=np.float32)
+        radians = np.deg2rad(compass_degrees)
+        directions = np.stack((np.sin(radians), np.cos(radians)), axis=1)
+        expected = []
+        for left, right in self.pairs:
+            delta = self.mic_positions[left] - self.mic_positions[right]
+            expected.append(-(directions @ delta) / SPEED_OF_SOUND_M_S)
+        return np.stack(expected, axis=1).astype(np.float32)
+
+    @staticmethod
+    def _next_power_of_two(value: int) -> int:
+        result = 1
+        while result < value:
+            result <<= 1
+        return result
+
+    def _gcc_phat(
+        self,
+        sig: np.ndarray,
+        refsig: np.ndarray,
+        *,
+        max_tau: float,
+        interp: int = 16,
+    ) -> float | None:
+        n = self._next_power_of_two(sig.size + refsig.size)
+        sig_fft = np.fft.rfft(sig, n=n)
+        ref_fft = np.fft.rfft(refsig, n=n)
+        cross_power = sig_fft * np.conj(ref_fft)
+        cross_power /= np.abs(cross_power) + 1e-12
+        cc = np.fft.irfft(cross_power, n=interp * n)
+
+        max_shift = min(int(round(interp * self.sample_rate * max_tau)), (interp * n) // 2)
+        if max_shift < 1:
             return None
+
+        cc = np.concatenate((cc[-max_shift:], cc[: max_shift + 1]))
+        shift = int(np.argmax(cc)) - max_shift
+        return float(shift) / float(interp * self.sample_rate)
+
+    def _select_loudest_window(self, audio: np.ndarray) -> np.ndarray:
+        if audio.shape[0] <= self.window_samples:
+            return audio
+
+        step = max(128, self.window_samples // 4)
+        best_start = 0
+        best_power = -1.0
+        last_start = audio.shape[0] - self.window_samples
+        for start in range(0, last_start + 1, step):
+            window = audio[start : start + self.window_samples]
+            power = float(np.mean(np.square(window)))
+            if power > best_power:
+                best_power = power
+                best_start = start
+        return audio[best_start : best_start + self.window_samples]
+
+    def estimate(self, chunk: np.ndarray) -> DOAReading:
+        if not self.enabled:
+            return DOAReading(None, "audio", "audio_disabled")
+        if self.status == "audio_channels_unavailable":
+            return DOAReading(None, "audio", self.status)
+        if chunk.ndim != 2 or chunk.shape[1] <= max(self.channel_indices):
+            self.status = "audio_channels_unavailable"
+            return DOAReading(None, "audio", self.status)
+
+        raw = chunk[:, self.channel_indices].astype(np.float32, copy=True)
+        raw = self._select_loudest_window(raw)
+        raw_dbfs = rms_dbfs(raw.reshape(-1))
+        if self.min_dbfs is not None and raw_dbfs < self.min_dbfs:
+            self.status = f"audio_low_signal {raw_dbfs:+.1f}dBFS"
+            return DOAReading(None, "audio", self.status)
+
+        raw -= np.mean(raw, axis=0, keepdims=True)
+        channel_rms = np.sqrt(np.mean(np.square(raw), axis=0) + 1e-12)
+        usable_channels = channel_rms > 1e-5
+        if int(np.count_nonzero(usable_channels)) < 2:
+            self.status = "audio_not_enough_active_channels"
+            return DOAReading(None, "audio", self.status)
+
+        raw /= channel_rms.reshape(1, -1)
+        raw *= np.hanning(raw.shape[0]).astype(np.float32).reshape(-1, 1)
+
+        measured_taus = []
+        pair_indices = []
+        for pair_index, (left, right) in enumerate(self.pairs):
+            if not (usable_channels[left] and usable_channels[right]):
+                continue
+            max_tau = (
+                float(np.linalg.norm(self.mic_positions[left] - self.mic_positions[right]))
+                / SPEED_OF_SOUND_M_S
+            )
+            tau = self._gcc_phat(raw[:, left], raw[:, right], max_tau=max_tau)
+            if tau is None:
+                continue
+            measured_taus.append(tau)
+            pair_indices.append(pair_index)
+
+        if len(measured_taus) < 2:
+            self.status = "audio_not_enough_tdoa_pairs"
+            return DOAReading(None, "audio", self.status)
+
+        measured = np.asarray(measured_taus, dtype=np.float32)
+        expected = self.expected_taus[:, pair_indices]
+        errors = np.mean(np.square(expected - measured.reshape(1, -1)), axis=1)
+        angle = int(np.argmin(errors)) % 360
+        error_us = float(np.sqrt(np.min(errors)) * 1_000_000.0)
+        self.status = f"audio_active {raw_dbfs:+.1f}dBFS err={error_us:.1f}us"
+        return DOAReading(angle, "audio", self.status)
+
+
+def choose_doa_reading(
+    *,
+    doa_source: str,
+    usb_reader: DOAReader,
+    audio_estimator: AudioDOAEstimator,
+    chunk: np.ndarray,
+) -> DOAReading:
+    if doa_source == "audio":
+        return audio_estimator.estimate(chunk)
+    if doa_source == "usb":
+        return usb_reader.snapshot()
+
+    audio_reading = audio_estimator.estimate(chunk)
+    if audio_reading.raw_angle is not None:
+        return audio_reading
+
+    usb_reading = usb_reader.snapshot()
+    if usb_reading.raw_angle is not None:
+        return usb_reading
+
+    return DOAReading(
+        None,
+        "none",
+        f"{audio_reading.status};{usb_reading.status}",
+    )
 
 
 class AppInferenceCharacteristic(ble.InferenceCharacteristic):
@@ -338,10 +669,11 @@ def build_app_sound_packet(
     raw_angle: int | None,
     north_offset: float,
     doa_status: str,
+    doa_source: str,
     full_packet: bool,
 ) -> dict:
     if raw_angle is None:
-        angle = 0
+        angle = None
         direction = ""
         direction_text = ""
     else:
@@ -359,10 +691,12 @@ def build_app_sound_packet(
         "db": app_db,
         "level": risk_level(label),
         "direction": direction,
-        "angle": float(angle),
-        "angle_raw": float(raw_angle if raw_angle is not None else 0),
+        "angle": float(angle) if angle is not None else None,
+        "angle_raw": float(raw_angle) if raw_angle is not None else None,
         "direction_text": direction_text,
         "doa_status": doa_status,
+        "doa_source": doa_source,
+        "has_doa": raw_angle is not None,
     }
 
     if full_packet:
@@ -403,7 +737,9 @@ def run_stream_ble_doa(
     enhance_sharpness: float,
     min_score: float,
     ble_server: AppBleInferenceServer,
-    doa_reader: DOAReader,
+    usb_doa_reader: DOAReader,
+    audio_doa_estimator: AudioDOAEstimator,
+    doa_source: str,
     north_offset: float,
     db_offset: float,
     full_packet: bool,
@@ -437,7 +773,9 @@ def run_stream_ble_doa(
         f"min_dbfs={db_gate_threshold(min_db):+.1f}, "
         f"enhance_threshold_dbfs={db_gate_threshold(enhance_threshold_db):+.1f}, "
         f"noise_reduction_db={noise_reduction_db:.1f}, main_gain_db={main_gain_db:+.1f}, "
-        f"min_score={min_score:.1%}, doa={doa_reader.status}"
+        f"min_score={min_score:.1%}, doa_source={doa_source}, "
+        f"audio_doa_min_dbfs={format_optional_db_gate(audio_doa_estimator.min_dbfs)}, "
+        f"usb_doa={usb_doa_reader.status}, audio_doa={audio_doa_estimator.status}"
     )
     print("Ctrl+C to stop.")
 
@@ -453,18 +791,18 @@ def run_stream_ble_doa(
     ):
         while True:
             block = audio_queue.get()
-            mono = block[:, channel_index].astype(np.float32, copy=True)
-            pending_blocks.append(mono)
-            pending_samples += mono.shape[0]
+            pending_blocks.append(block.astype(np.float32, copy=True))
+            pending_samples += block.shape[0]
 
             if pending_samples < CHUNK_SAMPLES:
                 continue
 
-            joined = np.concatenate(pending_blocks)
+            joined = np.concatenate(pending_blocks, axis=0)
             offset = 0
             while joined.shape[0] - offset >= CHUNK_SAMPLES:
                 chunk_started = time.perf_counter()
-                chunk = joined[offset: offset + CHUNK_SAMPLES]
+                chunk_multi = joined[offset: offset + CHUNK_SAMPLES]
+                chunk = chunk_multi[:, channel_index].astype(np.float32, copy=True)
                 offset += CHUNK_SAMPLES
 
                 timestamp = datetime.now().strftime("%H:%M:%S")
@@ -514,10 +852,22 @@ def run_stream_ble_doa(
                     status_text = "detected"
                     line_color = ANSI_GREEN
 
-                raw_angle = doa_reader.read_angle()
+                doa_reading = choose_doa_reading(
+                    doa_source=doa_source,
+                    usb_reader=usb_doa_reader,
+                    audio_estimator=audio_doa_estimator,
+                    chunk=chunk_multi,
+                )
+                raw_angle = doa_reading.raw_angle
                 angle = corrected_angle(raw_angle, north_offset) if raw_angle is not None else None
                 direction = angle_to_cardinal(angle) if angle is not None else ""
-                doa_text = f" | DOA={direction} {angle}deg raw={raw_angle}" if angle is not None else ""
+                if angle is None:
+                    doa_text = f" | DOA=unavailable source={doa_reading.source} status={doa_reading.status}"
+                else:
+                    doa_text = (
+                        f" | DOA={direction} {angle}deg raw={raw_angle} "
+                        f"source={doa_reading.source} status={doa_reading.status}"
+                    )
 
                 line = (
                     f"[{timestamp}] predict: {best_label} ({best_probability:.1%}) | "
@@ -546,7 +896,8 @@ def run_stream_ble_doa(
                         raw_line=line,
                         raw_angle=raw_angle,
                         north_offset=north_offset,
-                        doa_status=doa_reader.status,
+                        doa_status=doa_reading.status,
+                        doa_source=doa_reading.source,
                         full_packet=full_packet,
                     )
                 )
@@ -595,7 +946,22 @@ def main() -> int:
         ble_server.stop()
         return 1
 
-    doa_reader = DOAReader(enabled=not args.disable_doa)
+    usb_doa_reader = DOAReader(
+        enabled=not args.disable_doa and args.doa_source in ("auto", "usb"),
+        poll_interval=args.doa_poll_interval,
+        disabled_reason=(
+            "disabled by --disable-doa"
+            if args.disable_doa
+            else "disabled because --doa-source=audio"
+        ),
+    )
+    audio_doa_estimator = AudioDOAEstimator(
+        enabled=not args.disable_doa and args.doa_source in ("auto", "audio"),
+        stream_channels=stream_channels,
+        sample_rate=SAMPLE_RATE,
+        min_db=args.audio_doa_min_db,
+        window_ms=args.audio_doa_window_ms,
+    )
     stop_requested = False
 
     def stop(_signum, _frame) -> None:
@@ -626,7 +992,9 @@ def main() -> int:
             enhance_sharpness=args.enhance_sharpness,
             min_score=args.min_score,
             ble_server=ble_server,
-            doa_reader=doa_reader,
+            usb_doa_reader=usb_doa_reader,
+            audio_doa_estimator=audio_doa_estimator,
+            doa_source=args.doa_source,
             north_offset=args.north_offset,
             db_offset=args.db_offset,
             full_packet=args.full_packet,
@@ -640,6 +1008,7 @@ def main() -> int:
     finally:
         if stop_requested:
             print("Stopping BLE server...", flush=True)
+        usb_doa_reader.stop()
         ble_server.stop()
 
 
