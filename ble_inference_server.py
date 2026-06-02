@@ -9,9 +9,11 @@ import dbus.exceptions
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-from ble_adapter import BleAdapter
-from ble_constants import (
+from config import (
+    ADAPTER_IFACE,
     BLUEZ_SERVICE_NAME,
+    DBUS_OM_IFACE,
+    DBUS_PROP_IFACE,
     GATT_MANAGER_IFACE,
     INFERENCE_CHAR_UUID,
     LE_ADVERTISING_MANAGER_IFACE,
@@ -46,12 +48,11 @@ class BleInferenceServer:
     def start(self) -> None:
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
         bus = dbus.SystemBus()
-        adapter = BleAdapter(bus)
-        adapter_path = adapter.find_path()
+        adapter_path = self._find_adapter_path(bus)
         if not adapter_path:
             raise RuntimeError("No Bluetooth adapter with BLE GATT/advertising support was found.")
 
-        adapter.set_powered(adapter_path)
+        self._set_adapter_powered(bus, adapter_path)
         self.service_manager = dbus.Interface(
             bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
             GATT_MANAGER_IFACE,
@@ -96,6 +97,26 @@ class BleInferenceServer:
         if self.startup_error:
             self.stop()
             raise RuntimeError(self.startup_error)
+
+    @staticmethod
+    def _find_adapter_path(bus: dbus.SystemBus) -> str | None:
+        object_manager = dbus.Interface(
+            bus.get_object(BLUEZ_SERVICE_NAME, "/"),
+            DBUS_OM_IFACE,
+        )
+        objects = object_manager.GetManagedObjects()
+        for path, interfaces in objects.items():
+            if GATT_MANAGER_IFACE in interfaces and LE_ADVERTISING_MANAGER_IFACE in interfaces:
+                return path
+        return None
+
+    @staticmethod
+    def _set_adapter_powered(bus: dbus.SystemBus, adapter_path: str) -> None:
+        properties = dbus.Interface(
+            bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
+            DBUS_PROP_IFACE,
+        )
+        properties.Set(ADAPTER_IFACE, "Powered", dbus.Boolean(True))
 
     def _app_registered(self) -> None:
         self.app_ready = True

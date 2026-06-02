@@ -4,10 +4,11 @@ import json
 import sys
 
 import dbus
+import dbus.exceptions
 import dbus.service
 from gi.repository import GLib
 
-from ble_constants import (
+from config import (
     ADVERTISEMENT_PATH,
     APP_PATH,
     DBUS_OM_IFACE,
@@ -17,7 +18,14 @@ from ble_constants import (
     INFERENCE_CHAR_UUID,
     LE_ADVERTISEMENT_IFACE,
 )
-from ble_utils import InvalidArgsException, byte_array
+
+
+class InvalidArgsException(dbus.exceptions.DBusException):
+    _dbus_error_name = "org.freedesktop.DBus.Error.InvalidArgs"
+
+
+def byte_array(data: bytes) -> dbus.Array:
+    return dbus.Array([dbus.Byte(byte) for byte in data], signature="y")
 
 
 class Application(dbus.service.Object):

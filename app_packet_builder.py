@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from config import CAUTION_LABELS, DANGER_LABELS
-from direction_utils import DirectionUtils
+from doa import corrected_angle, direction_text as format_direction_text
 
 
 class AppPacketBuilder:
@@ -46,10 +46,10 @@ class AppPacketBuilder:
         if raw_angle is None:
             angle = None
             direction = ""
-            direction_text = ""
+            direction_label = ""
         else:
-            angle = DirectionUtils.corrected_angle(raw_angle, self.north_offset)
-            direction, direction_text = DirectionUtils.direction_text(angle)
+            angle = corrected_angle(raw_angle, self.north_offset)
+            direction, direction_label = format_direction_text(angle)
 
         app_db = self.app_db_from_dbfs(chunk_dbfs)
         packet = {
@@ -64,7 +64,7 @@ class AppPacketBuilder:
             "direction": direction,
             "angle": float(angle) if angle is not None else None,
             "angle_raw": float(raw_angle) if raw_angle is not None else None,
-            "direction_text": direction_text,
+            "direction_text": direction_label,
             "doa_status": doa_status,
             "doa_source": doa_source,
             "has_doa": raw_angle is not None,

@@ -1,15 +1,31 @@
 from __future__ import annotations
 
+import io
+import os
 import sys
+import warnings
 from collections.abc import Sequence
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 
-from config import AUDIOSET_CLASS_COUNT, MODEL_INPUT_SAMPLES
+from config import (
+    AUDIOSET_CLASS_COUNT,
+    FMAX,
+    HOP_SIZE,
+    LABEL_MAPPING,
+    MODEL_INPUT_SAMPLES,
+    MODEL_NAME,
+    MODEL_SAMPLE_RATE,
+    N_FFT,
+    N_MELS,
+    SAMPLE_RATE,
+    WINDOW_SIZE,
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +55,133 @@ class SoundClassifier:
         self.audioset_labels = list(audioset_labels)
         self.device = device
         self.debug = bool(debug)
+
+    @classmethod
+    def from_efficientat(
+        cls,
+        efficientat_dir: Path | str,
+        *,
+        device: Any | None = None,
+        debug: bool = False,
+    ) -> "SoundClassifier":
+        if device is None:
+            device = cls.select_device()
+
+        model, mel, audioset_labels, resampler = cls._load_efficientat(
+            Path(efficientat_dir),
+            device,
+        )
+        return cls(
+            model=model,
+            mel=mel,
+            resampler=resampler,
+            custom_indices=cls._build_custom_label_indices(audioset_labels),
+            audioset_labels=audioset_labels,
+            device=device,
+            debug=debug,
+        )
+
+    @staticmethod
+    def select_device() -> Any:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    @classmethod
+    def _load_efficientat(cls, efficientat_dir: Path, device: Any) -> tuple[Any, Any, list[str], Any | None]:
+        if not efficientat_dir.exists():
+            raise RuntimeError(
+                f"EfficientAT repository was not found: {efficientat_dir}\n"
+                "Run `bash install.sh` first or pass --efficientat-dir."
+            )
+
+        repo_dir = efficientat_dir.resolve()
+        repo_text = str(repo_dir)
+        if repo_text not in sys.path:
+            sys.path.insert(0, repo_text)
+
+        old_cwd = os.getcwd()
+        try:
+            # EfficientAT helper modules load metadata/resources by relative path.
+            os.chdir(repo_text)
+            from helpers.utils import NAME_TO_WIDTH, labels  # type: ignore
+            from models.mn.model import get_model as get_mn  # type: ignore
+            from models.preprocess import AugmentMelSTFT  # type: ignore
+
+            with redirect_stdout(io.StringIO()), warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Don't use ConvNormActivation directly.*",
+                    category=UserWarning,
+                    module="torchvision\\.ops\\.misc",
+                )
+                model = get_mn(
+                    width_mult=NAME_TO_WIDTH(MODEL_NAME),
+                    pretrained_name=MODEL_NAME,
+                    strides=(2, 2, 2, 2),
+                    head_type="mlp",
+                )
+
+            mel = AugmentMelSTFT(
+                n_mels=N_MELS,
+                sr=MODEL_SAMPLE_RATE,
+                win_length=WINDOW_SIZE,
+                hopsize=HOP_SIZE,
+                n_fft=N_FFT,
+                fmax=FMAX,
+                freqm=0,
+                timem=0,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name == "torchvision":
+                raise RuntimeError(
+                    "EfficientAT model loading requires torchvision. "
+                    "Install it with `pip install torchvision` and retry."
+                ) from exc
+            raise
+        finally:
+            os.chdir(old_cwd)
+
+        model.to(device).eval()
+        mel.to(device).eval()
+        return model, mel, list(labels), cls._create_resampler(device)
+
+    @staticmethod
+    def _create_resampler(device: Any) -> Any | None:
+        if SAMPLE_RATE == MODEL_SAMPLE_RATE:
+            return None
+
+        import torchaudio
+
+        return torchaudio.transforms.Resample(
+            orig_freq=SAMPLE_RATE,
+            new_freq=MODEL_SAMPLE_RATE,
+        ).to(device).eval()
+
+    @staticmethod
+    def _build_custom_label_indices(audioset_labels: Sequence[str]) -> dict[str, list[int]]:
+        if len(audioset_labels) != AUDIOSET_CLASS_COUNT:
+            raise RuntimeError(
+                f"AudioSet label count is not {AUDIOSET_CLASS_COUNT}: {len(audioset_labels)}"
+            )
+
+        label_to_index = {label: index for index, label in enumerate(audioset_labels)}
+        indices: dict[str, list[int]] = {}
+        missing: dict[str, list[str]] = {}
+
+        for custom_label, labels in LABEL_MAPPING.items():
+            matched = [label_to_index[label] for label in labels if label in label_to_index]
+            not_found = [label for label in labels if label not in label_to_index]
+            indices[custom_label] = matched
+            if not_found:
+                missing[custom_label] = not_found
+
+        if missing:
+            details = "; ".join(
+                f"{custom_label}: {', '.join(labels)}"
+                for custom_label, labels in missing.items()
+            )
+            raise RuntimeError(f"AudioSet labels were not found: {details}")
+
+        return indices
 
     def predict(self, waveform: np.ndarray) -> ClassificationResult:
         waveform = np.asarray(waveform, dtype=np.float32)

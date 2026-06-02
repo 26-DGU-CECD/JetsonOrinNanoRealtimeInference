@@ -6,13 +6,13 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from cli import CliParser
-from io_setup import IOSetup
+from cli import parse_args
+from io_setup import configure_stdio
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    IOSetup.configure_stdio()
-    args = CliParser().parse_args(argv)
+    configure_stdio()
+    args = parse_args(argv)
 
     from audio_device_finder import AudioDeviceFinder
 
@@ -42,55 +42,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     controller = None
-    usb_doa_reader = None
+    doa_manager = None
     stop_requested = False
 
     try:
         from app_packet_builder import AppPacketBuilder
         from audio_stream_controller import AudioStreamController, AudioStreamSettings
         from config import MODEL_INPUT_SECONDS, MODEL_SAMPLE_RATE, SAMPLE_RATE
-        from doa_audio_estimator import DOAAudioEstimator
-        from doa_selector import DOASelector
-        from doa_usb_reader import DOAUsbReader
-        from efficientat_model_loader import EfficientATModelLoader
-        from label_mapper import LabelMapper
+        from doa import DOAManager
         from sound_classifier import SoundClassifier
 
-        model_loader = EfficientATModelLoader(Path(args.efficientat_dir))
-        device = model_loader.select_device()
+        device = SoundClassifier.select_device()
         print(f"Inference device: {device}")
-        artifacts = model_loader.load(device)
-        custom_indices = LabelMapper(artifacts.audioset_labels).build_custom_label_indices()
-        classifier = SoundClassifier(
-            model=artifacts.model,
-            mel=artifacts.mel,
-            resampler=artifacts.resampler,
-            custom_indices=custom_indices,
-            audioset_labels=artifacts.audioset_labels,
-            device=artifacts.device,
+        classifier = SoundClassifier.from_efficientat(
+            Path(args.efficientat_dir),
+            device=device,
             debug=args.debug,
         )
-
-        usb_doa_reader = DOAUsbReader(
-            enabled=not args.disable_doa and args.doa_source in ("auto", "usb"),
-            poll_interval=args.doa_poll_interval,
-            disabled_reason=(
-                "disabled by --disable-doa"
-                if args.disable_doa
-                else "disabled because --doa-source=audio"
-            ),
-        )
-        audio_doa_estimator = DOAAudioEstimator(
-            enabled=not args.disable_doa and args.doa_source in ("auto", "audio"),
+        doa_manager = DOAManager(
+            source=args.doa_source,
+            disabled=args.disable_doa,
             stream_channels=audio_device.stream_channels,
             sample_rate=SAMPLE_RATE,
-            min_db=args.audio_doa_min_db,
-            window_ms=args.audio_doa_window_ms,
-        )
-        doa_selector = DOASelector(
-            source=args.doa_source,
-            usb_reader=usb_doa_reader,
-            audio_estimator=audio_doa_estimator,
+            usb_poll_interval=args.doa_poll_interval,
+            audio_min_db=args.audio_doa_min_db,
+            audio_window_ms=args.audio_doa_window_ms,
         )
         packet_builder = AppPacketBuilder(
             north_offset=args.north_offset,
@@ -115,14 +91,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         controller = AudioStreamController(
             settings=settings,
             classifier=classifier,
-            doa_selector=doa_selector,
+            doa_manager=doa_manager,
             packet_builder=packet_builder,
             ble_server=ble_server,
         )
     except Exception as exc:
         print(f"Initialization error: {exc}", file=sys.stderr, flush=True)
-        if usb_doa_reader is not None:
-            usb_doa_reader.stop()
+        if doa_manager is not None:
+            doa_manager.stop()
         ble_server.stop()
         return 1
 
@@ -148,8 +124,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if stop_requested:
             print("Stopping services...", flush=True)
         controller.stop()
-        if usb_doa_reader is not None:
-            usb_doa_reader.stop()
+        if doa_manager is not None:
+            doa_manager.stop()
         ble_server.stop()
 
 
