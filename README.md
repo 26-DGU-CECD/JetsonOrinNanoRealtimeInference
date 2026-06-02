@@ -43,7 +43,7 @@ which pip
 
 출력이 프로젝트의 `.venv/bin/python`, `.venv/bin/pip`를 가리키면 됩니다.
 
-BLE 버전(`realtime_inference_ble.py`)은 Ubuntu/Jetson의 `python3-dbus`, `python3-gi` 시스템 패키지를 사용합니다. 이미 `python3 -m venv .venv`로 가상환경을 만들었다면 다음 값으로 바꾼 뒤 다시 실행하세요.
+BLE 서버는 Ubuntu/Jetson의 `python3-dbus`, `python3-gi` 시스템 패키지를 사용합니다. 이미 `python3 -m venv .venv`로 가상환경을 만들었다면 다음 값으로 바꾼 뒤 다시 실행하세요.
 
 ```bash
 sed -i 's/include-system-site-packages = false/include-system-site-packages = true/' .venv/pyvenv.cfg
@@ -58,38 +58,74 @@ pip install sounddevice "numpy<2" pandas scikit-learn seaborn matplotlib librosa
 ## 실행
 
 ```bash
-python realtime_inference.py
+python main.py
 ```
 
-기본값은 2초 청크마다 항상 추론 결과를 출력합니다. `--min-db 30`은 `-30 dBFS`보다 작은 입력을 빨간색 `status=낮음(소리작음 ...)`으로 표시하는 기준입니다.
+기본값은 2초 청크마다 항상 추론 결과를 출력하고 BLE notify로 앱 호환 JSON packet을 전송합니다. `--min-db 30`은 `-30 dBFS`보다 작은 입력을 빨간색 `status=low(...)`로 표시하는 기준입니다.
 
 각 청크는 모델 입력 전에 expander 방식으로 왜곡/강조합니다. 작은 진폭의 노이즈는 `-18 dB` 줄이고, 큰 진폭의 메인 소리는 `+8 dB` 키워서 노이즈와 이벤트의 차이를 벌립니다.
 
 출력 점수는 EfficientAT의 527개 AudioSet logit에 sigmoid를 적용한 값입니다. 커스텀 클래스가 여러 AudioSet 라벨을 묶는 경우, 해당 라벨들의 sigmoid 점수 중 가장 큰 값을 표시합니다. 이 값들은 multi-label confidence라서 전체 합이 100%가 되지 않습니다.
 
-기본 `--min-score 0.05`가 적용되어 최고 커스텀 점수가 5% 미만이면 빨간색 `status=낮음(점수낮음 ...)`으로 표시합니다. 입력 레벨과 점수가 모두 기준을 넘으면 초록색 `status=감지`로 표시됩니다.
+기본 `--min-score 0.05`가 적용되어 최고 커스텀 점수가 5% 미만이면 빨간색 `status=low(...)`로 표시합니다. 입력 레벨과 점수가 모두 기준을 넘으면 초록색 `status=detected`로 표시됩니다.
 
 ```bash
-python realtime_inference.py --min-db 30 --min-score 0.05 --enhance-threshold-db 35 --noise-reduction-db 18 --main-gain-db 8
+python main.py --efficientat-dir ./EfficientAT --min-db 30 --min-score 0.05 --enhance-threshold-db 35 --noise-reduction-db 18 --main-gain-db 8
 ```
 
 매 2초마다 다음 형식으로 출력됩니다.
 
 ```text
-[HH:MM:SS] 예측: construction (72.3%) | status=감지 | level=-22.4 dBFS | enhanced=-15.1 dBFS | quiet_gain=0.13x loud_gain=2.51x | 전체: construction=72.3%, gunshot=3.1%, ...
+[HH:MM:SS] predict: construction (72.3%) | status=detected | level=-22.4 dBFS | app_db=57.6 dB | enhanced=-15.1 dBFS | infer=0.123s | quiet_gain=0.13x loud_gain=2.51x | DOA=북 0deg raw=0 source=audio status=audio_active -22.4dBFS err=10.0us | all: construction=72.3%, gunshot=3.1%, ...
 ```
 
 디바이스명이 자동 탐색되지 않으면 입력 디바이스 목록을 확인한 뒤 index를 직접 지정할 수 있습니다.
 
 ```bash
-python realtime_inference.py --list-devices
-python realtime_inference.py --device-index 3
+python main.py --list-devices
+python main.py --device-index 3
 ```
 
 ReSpeaker 4 Mic Array 6채널 펌웨어는 보통 `ch0=처리된 오디오`, `ch1-4=raw mic`, `ch5=playback`입니다. `ch0`이 클리핑되거나 너무 크게 나오면 raw mic 채널을 지정해서 실행하세요.
 
 ```bash
-python realtime_inference.py --device-index 15 --channel-index 1
+python main.py --device-index 15 --channel-index 1
+```
+
+DOA는 기본값 `--doa-source auto`로 raw mic audio 기반 추정을 먼저 사용하고, 실패하면 ReSpeaker USB DSP angle을 사용합니다. 필요한 경우 `--doa-source audio`, `--doa-source usb`, `--disable-doa`, `--north-offset`을 지정할 수 있습니다.
+
+## 파일 구조
+
+새 실행 코드는 루트의 클래스 기반 모듈로 구성되어 있고, 최종 진입점은 `main.py`입니다. 기존 통합 실행 파일 세 개는 삭제하지 않고 `demo/` 폴더로 옮겨 참고용으로만 남겼습니다.
+
+```text
+project_root/
+├── main.py                         # CLI 파싱 후 전체 구성요소 조립 및 실행
+├── config.py                       # 샘플레이트, 모델, 라벨, BLE UUID, DOA 상수
+├── cli.py                          # argparse 옵션 정의
+├── audio_device_finder.py          # 입력 장치 목록과 ReSpeaker 자동 탐색
+├── microphone_module.py            # sounddevice InputStream 관리
+├── audio_queue.py                  # thread-safe audio queue wrapper
+├── audio_buffer.py                 # block 누적 및 2초 chunk 생성
+├── audio_level_meter.py            # RMS 기반 dBFS 계산
+├── db_threshold_gate.py            # dBFS threshold 변환 및 판단
+├── audio_preprocessor.py           # 작은 신호 감소/큰 신호 강조 전처리
+├── efficientat_model_loader.py     # EfficientAT model/mel/resampler 로딩
+├── label_mapper.py                 # AudioSet label을 custom label로 매핑
+├── sound_classifier.py             # EfficientAT 추론 및 custom score 계산
+├── doa_usb_reader.py               # ReSpeaker USB tuning 기반 DOA polling
+├── doa_audio_estimator.py          # GCC-PHAT 기반 audio DOA 추정
+├── doa_selector.py                 # auto/audio/usb DOA 선택
+├── direction_utils.py              # north offset, 방위, 방향 텍스트 생성
+├── ble_gatt_objects.py             # BlueZ DBus GATT/advertisement 객체
+├── ble_adapter.py                  # Bluetooth adapter 탐색 및 power 설정
+├── ble_inference_server.py         # GATT 등록, advertising, notify publish
+├── app_packet_builder.py           # 앱 호환 JSON packet 생성
+├── audio_stream_controller.py      # 실시간 오디오 루프와 BLE publish
+└── demo/
+    ├── realtime_inference.py
+    ├── realtime_inference_ble.py
+    └── realtime_inference_ble_doa.py
 ```
 
 ## ReSpeaker V3 연결 확인
@@ -102,7 +138,7 @@ python -m sounddevice
 
 ## 문제 해결
 
-- 디바이스를 못 찾을 때: `python -m sounddevice` 또는 `python realtime_inference.py --list-devices`로 실제 이름과 index를 확인한 뒤 `--device-index`를 사용하세요.
+- 디바이스를 못 찾을 때: `python -m sounddevice` 또는 `python main.py --list-devices`로 실제 이름과 index를 확인한 뒤 `--device-index`를 사용하세요.
 - CUDA가 없을 때: 스크립트가 자동으로 CPU를 사용합니다. CPU에서는 추론이 느릴 수 있지만 별도 설정은 필요 없습니다.
 - EfficientAT 저장소가 없을 때: `bash install.sh`를 먼저 실행하거나 `--efficientat-dir`로 clone된 경로를 지정하세요.
 - 모델 로딩 중 `torchvision` 오류가 날 때: `pip install torchvision`을 실행하세요.
